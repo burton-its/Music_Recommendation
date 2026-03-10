@@ -1,18 +1,37 @@
-"""flask for user authentication (login, logout, register)."""
+"""Flask app for music recommendations with auth microservice integration."""
 
-from flask import Flask, request, redirect, render_template, url_for, session, jsonify
-from flask_mysqldb import MySQL
-import MySQLdb.cursors
-import bcrypt
+from flask import Flask, request, redirect, render_template, url_for, session, jsonify, make_response
+import requests
 import re
 from config import Config
 from recommender import load_artifacts, recommend
 
 app = Flask(__name__)
 app.config.from_object(Config)
-mysql = MySQL(app)
 
 ARTIFACTS = None
+REQUEST_TIMEOUT_SECONDS = 5
+
+
+def _safe_post_json(url, payload):
+    """Call an HTTP endpoint and return (ok, data_or_error_message, response)."""
+    try:
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    except requests.RequestException:
+        return False, "Service unavailable. Please try again.", None
+
+    if 200 <= resp.status_code < 300:
+        try:
+            return True, resp.json(), resp
+        except ValueError:
+            return True, None, resp
+
+    try:
+        err_payload = resp.json()
+        detail = err_payload.get("detail") or err_payload.get("error")
+    except ValueError:
+        detail = None
+    return False, detail or f"Request failed ({resp.status_code}).", resp
 
 # login route
 @app.route("/")
@@ -23,23 +42,41 @@ def login():
     msg = ""
     if request.method == "POST" and "email" in request.form and "password" in request.form:
         email = request.form["email"].strip().lower()
-        password = request.form["password"].encode("utf-8")
+        password = request.form["password"]
 
-        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-        cursor.execute(
-            "SELECT id, email, password_hash FROM users WHERE email = %s",
-            (email,),
+        auth_ok, auth_result, auth_resp = _safe_post_json(
+            f"{app.config['AUTH_SERVICE_URL']}/auth/login",
+            {"email": email, "password": password},
         )
-        account = cursor.fetchone()
-        cursor.close()
+        if not auth_ok:
+            return render_template("login.html", msg=f"Login failed: {auth_result}")
 
-        if account and bcrypt.checkpw(password, account["password_hash"].encode("utf-8")):
-            session["loggedin"] = True
-            session["id"] = account["id"]
-            session["email"] = account["email"]
-            return render_template("index.html", msg="Logged in successfully!")
-        else:
-            msg = "Incorrect email/password!"
+        token = auth_resp.cookies.get("access_token") if auth_resp else None
+        if not token:
+            return render_template("login.html", msg="Login failed: missing access token.")
+
+        validator_ok, validator_result, _ = _safe_post_json(
+            f"{app.config['VALIDATOR_SERVICE_URL']}/validate-token",
+            {"token": token},
+        )
+        if not validator_ok:
+            return render_template("login.html", msg=f"Token validation failed: {validator_result}")
+
+        if validator_result is not True:
+            return render_template("login.html", msg="Token validation failed.")
+
+        session["loggedin"] = True
+        session["email"] = email
+        response = make_response(render_template("index.html", msg="Logged in successfully!"))
+        response.set_cookie(
+            "access_token",
+            token,
+            httponly=True,
+            secure=False,
+            samesite="Lax",
+            max_age=app.config["ACCESS_TOKEN_EXPIRE_SECONDS"],
+        )
+        return response
 
     return render_template("login.html", msg=msg)
 
@@ -48,8 +85,17 @@ def login():
 def logout():
     """Clear session and redirect to login.
     """
+    token = request.cookies.get("access_token")
+    if token:
+        _safe_post_json(
+            f"{app.config['LOGOUT_SERVICE_URL']}/revoke",
+            {"token": token, "reason": "user_logout"},
+        )
+
     session.clear()
-    return redirect(url_for("login"))
+    response = make_response(redirect(url_for("login")))
+    response.delete_cookie("access_token")
+    return response
 
 # register route
 @app.route("/register", methods=["GET", "POST"])
@@ -66,33 +112,12 @@ def register():
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             return render_template("register.html", msg="Invalid email address!")
 
-        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-        # get id
-        cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
-        existing = cursor.fetchone()
-
-        if existing:
-            cursor.close()
-            return render_template("register.html", msg="Account already exists!")
-
-        password_hash = bcrypt.hashpw(
-            password_raw.encode("utf-8"),
-            bcrypt.gensalt(),
-        ).decode("utf-8")
-
-        try:
-            # insert user into mysql
-            cursor.execute(
-                "INSERT INTO users (email, password_hash) VALUES (%s, %s)",
-                (email, password_hash),
-            )
-            mysql.connection.commit()
-        except Exception as e:
-            mysql.connection.rollback()
-            cursor.close()
-            return render_template("register.html", msg=f"Registration failed: {e}")
-        finally:
-            cursor.close()
+        reg_ok, reg_result, _ = _safe_post_json(
+            f"{app.config['AUTH_SERVICE_URL']}/auth/register",
+            {"email": email, "password": password_raw},
+        )
+        if not reg_ok:
+            return render_template("register.html", msg=f"Registration failed: {reg_result}")
 
         return redirect(url_for("login"))
 

@@ -3,3 +3,4 @@ Flask-MySQLdb
 mysqlclient
 bcrypt
 python-dotenv
+requests
